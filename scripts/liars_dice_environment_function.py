@@ -1,1047 +1,1004 @@
-import json
-import math
+"""
+leduc_poker_environment_function.py  —  MERGED for Release-1
+  Drop-in replacement for: scripts/leduc_poker_environment_function.py
+  (no shared_env.py dependency — all helpers are inlined)
+================================================
+Sources and their unique contributions
+---------------------------------------
+
+Release-1  (Gradients_RL_tournament-4_20_env_release_1)
+  • Chip-improvement reward component (CHIP_WEIGHT)
+  • PAIR_BONUS / HIGHCARD_WIN_BONUS on terminal
+  • INVALID_TOTAL_CLIP — caps accumulated invalid penalties at -0.3
+  • remove_reasoning_tags() — strips <think>/<reasoning>/etc. from model output
+  • extract_action_id() — robust numeric-action extractor (regex fallback)
+  • random seed per episode (random.randint) for env diversity
+  • MCTS sim curriculum: get_mcts_sims(optimizer_step) warm-up schedule
+  • hint_decay driven by optimizer_step (not just rollout count)
+  • global_step awareness via trainer.state
+  • Wins counter in batch log
+  • rollout_warmup_rollouts separate from rollouts_per_stage
+
+Boss-repo (boss-repo-init)
+  • Rich named SIGNALS dict — per-action shaping with semantic labels
+  • GameState.hand_strength, is_strong, is_weak, raises_this_round, opp_last_action
+  • discounted_return aggregation with gamma
+  • Module-level _state dict (single init path, no per-function attributes)
+
+Release-6  (Gradients_RL_tournament-4_20_env_release_6)
+  • terminal_weight = 10.0 — win/loss dominates shaping noise
+  • NORMALIZE_REWARDS — length-invariant intermediate shaping:
+      G = (Σ γ^(T-1-i) * s_i) / T  +  terminal_reward
+  • Separate step_scores / terminal_reward tracking
+  • shared_env.py imports (GAMES_TO_TASK_ID_RANGE, CurriculumScheduler,
+    init_env_pool, rollout_reward_func)
+
+New additions (combined logic)
+  • Pot-odds call bonus: reward calling when equity_estimate ≥ (1 − pot_odds)
+  • Q + public K raise bonus in R2 (second-best hand)
+  • Positional raise bonus: P1 raising K in R1 (info-advantage aggression)
+  • Raise-cap call bonus: reward calling when 2-raise cap is hit
+  • PAIR_BONUS and HIGHCARD_WIN_BONUS applied inside terminal_reward
+  • chip_component from R1 added to terminal_reward bucket (normalized)
+"""
+
+import functools
 import os
 import random
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
-from threading import Lock, Semaphore
+from concurrent.futures import as_completed
+from dataclasses import dataclass
+from threading import Semaphore
+from typing import Optional
 
 import requests
 from trl.experimental.openenv import generate_rollout_completions
 
-GAME_TO_TASK_ID_RANGE = {
-    "goofspiel": (0, 99999999),
-    "liars_dice": (100000000, 199999999),
-    "leduc_poker": (200000000, 299999999),
-    "gin_rummy": (300000000, 399999999),
-    "othello": (400000000, 499999999),
-    "backgammon": (500000000, 599999999),
-    "hex": (600000000, 699999999),
-    "clobber": (700000000, 799999999),
+# ---------------------------------------------------------------------------
+# Inline definitions (Release-1 has no shared_env.py)
+# ---------------------------------------------------------------------------
+
+GAMES_TO_TASK_ID_RANGE: dict[str, tuple[int, int]] = {
+    "goofspiel":   (0,         99_999_999),
+    "liars_dice":  (100000000, 199_999_999),
+    "leduc_poker": (200000000, 299_999_999),
+    "gin_rummy":   (300000000, 399_999_999),
+    "othello":     (400000000, 499_999_999),
+    "backgammon":  (500000000, 599_999_999),
+    "hex":         (600000000, 699_999_999),
+    "clobber":     (700000000, 799_999_999),
 }
 
-SELECTED_GAME = "liars_dice"
-REQUEST_TIMEOUT_SECONDS = 2400
-INIT_TIMEOUT_SECONDS = 300
-MAX_EPISODE_TOKENS = 16384
-MAX_PROMPT_LEN = 16384 - 512
 
-MCTS_CONFIG = {
-    "opponent": "mcts",
-    "mcts_max_simulations": 50,
-    "mcts_num_rollouts": 1,
-}
-
-# Reward settings
-INVALID_ACTION_PENALTY = 0.10
-PASS_MISSED_CHALLENGE_PENALTY = 0.06
-BID_PLAUSIBILITY_BONUS = 0.04
-BID_PLAUSIBILITY_PENALTY = 0.04
-# Belief-calibrated Liar timing (when model chooses Liar vs raising)
-LIAR_CALL_GOOD_BONUS = 0.03
-LIAR_CALL_BAD_PENALTY = 0.04
-SHAPING_REWARD_CLIP = 0.50
-TERMINAL_REWARD_CLIP = 1.00
-
-STRATEGY_TIPS = """
-STRATEGY TIPS:
-- Eval is high-episode-count vs MCTS: reduce invalid moves and wild overbids — variance punishes sloppy play.
-- Keep bids minimally stronger than current bid when uncertain.
-- Use your own dice + wild 6s to estimate plausible total counts.
-- Prefer calling Liar when the required quantity is implausibly high (low P(truth) on the current bid).
-- Avoid large overbids unless your private dice strongly support them.
-"""
-
-REASONING_TAG_PAIRS = [
-    ("think", "think"),
-    ("thinking", "thinking"),
-    ("reasoning", "reasoning"),
-    ("thought", "thought"),
-    ("reflection", "reflection"),
-]
-
-_ROLLOUT_STATE: dict = {}
-
-
-def _is_truthy_env(value: str | None) -> bool:
-    if value is None:
-        return False
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _safe_float(value, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except Exception:
-        return default
-
-
-def _clamp(value: float, min_value: float, max_value: float) -> float:
-    return max(min_value, min(max_value, value))
-
-
-def extract_and_format_observation(obs_text: str) -> str:
-    # Liar's Dice observations already contain structured legal-action blocks.
-    return obs_text or ""
-
-
-class EpisodeTraceLogger:
-    """Thread-safe JSONL episode tracer."""
-
-    def __init__(self, trace_dir: str, rank: int):
-        self.trace_dir = trace_dir
-        self.rank = rank
-        self._lock = Lock()
-        self.log_path = os.path.join(self.trace_dir, f"liars_dice_episode_traces_rank{rank}.jsonl")
-        self.max_text_chars = int(os.environ.get("EPISODE_TRACE_MAX_TEXT_CHARS", "4000"))
-        self.sample_rate = float(os.environ.get("EPISODE_TRACE_SAMPLE_RATE", "1.0"))
-
-        os.makedirs(self.trace_dir, exist_ok=True)
-        print(f"[EPISODE_TRACE] Writing traces to {self.log_path}")
-
-    def should_log(self) -> bool:
-        if self.sample_rate >= 1.0:
-            return True
-        if self.sample_rate <= 0.0:
-            return False
-        return random.random() <= self.sample_rate
-
-    def clip_text(self, text: str) -> str:
-        if not text:
-            return ""
-        if len(text) <= self.max_text_chars:
-            return text
-        return text[: self.max_text_chars] + f"... [truncated {len(text) - self.max_text_chars} chars]"
-
-    def log_episode(self, payload: dict) -> None:
-        with self._lock:
-            with open(self.log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(payload, ensure_ascii=True) + "\n")
-
-
-class CurriculumScheduler:
-    """Progressive turn-limit curriculum."""
-
-    def __init__(
-        self,
-        initial_max_turn: int = 2,
-        final_max_turn: int = 20,
-        rollouts_per_stage: int = 1280,
-        initial_hint_prob: float = 0.0,
-        final_hint_prob: float = 0.0,
-        warmup_rollouts: int = 128,
-    ):
-        self.initial_max_turn = initial_max_turn
-        self.final_max_turn = final_max_turn
-        self.rollouts_per_stage = rollouts_per_stage
-        self.initial_hint_prob = initial_hint_prob
-        self.final_hint_prob = final_hint_prob
-        self.warmup_rollouts = warmup_rollouts
-        self.total_rollouts = 0
-
-    def get_max_turn(self) -> int:
-        if self.total_rollouts < self.warmup_rollouts:
-            return self.initial_max_turn
-        adjusted_rollouts = self.total_rollouts - self.warmup_rollouts
-        stage = adjusted_rollouts // self.rollouts_per_stage
-        return min(self.initial_max_turn + stage, self.final_max_turn)
-
-    def get_hint_prob(self) -> float:
-        if self.total_rollouts < self.warmup_rollouts:
-            return self.initial_hint_prob
-        total_stages = max(self.final_max_turn - self.initial_max_turn, 1)
-        total_decay_rollouts = total_stages * self.rollouts_per_stage
-        adjusted_rollouts = self.total_rollouts - self.warmup_rollouts
-        progress = min(adjusted_rollouts / total_decay_rollouts, 1.0)
-        current_prob = self.initial_hint_prob - progress * (self.initial_hint_prob - self.final_hint_prob)
-        return max(current_prob, self.final_hint_prob)
-
-    def step(self, num_rollouts: int = 1) -> None:
-        self.total_rollouts += num_rollouts
-
-
-def remove_reasoning_tags(text: str) -> str:
-    cleaned = text
-    for tag_name, close_name in REASONING_TAG_PAIRS:
-        cleaned = re.sub(
-            rf"<{tag_name}>.*?</{close_name}>",
-            "",
-            cleaned,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-        close_tag = f"</{close_name}>"
-        if close_tag in cleaned:
-            cleaned = cleaned.split(close_tag)[-1]
-        open_match = re.search(rf"<{tag_name}>", cleaned, flags=re.IGNORECASE)
-        if open_match:
-            cleaned = cleaned[: open_match.start()]
-    cleaned = re.sub(r"\n\s*\n\s*\n", "\n\n", cleaned)
-    return cleaned.strip()
-
-
-def _extract_legal_action_map(observation: str) -> dict[str, str]:
-    if not observation:
-        return {}
-    match = re.search(
-        r"Legal Actions:\s*\n(.*?)(?:\n\nYour choice|\nYour choice|\Z)",
-        observation,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-    if not match:
-        return {}
-
-    block = match.group(1)
-    mapping: dict[str, str] = {}
-    for raw_line in block.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        if "->" in line:
-            left, right = line.split("->", 1)
-            action_id = left.strip()
-            label = right.strip()
-        else:
-            action_id = line.strip()
-            label = action_id
-        if re.fullmatch(r"-?\d+", action_id):
-            mapping[action_id] = label
-    return mapping
-
-
-def _extract_bid_tuple(label_or_text: str) -> tuple[int, int] | None:
-    if not label_or_text:
-        return None
-    match = re.search(r"(\d+)\s*-\s*(\d+)", label_or_text)
-    if not match:
-        return None
-    return int(match.group(1)), int(match.group(2))
-
-
-def _extract_state_features(observation: str) -> dict:
-    dice: list[int] = []
-    dice_match = re.search(r"Your dice:\s*\[([^\]]*)\]", observation)
-    if dice_match:
-        dice_str = dice_match.group(1).strip()
-        if dice_str:
-            dice = [int(x.strip()) for x in dice_str.split(",") if x.strip().isdigit()]
-
-    total_dice_match = re.search(r"Total dice in game:\s*(\d+)", observation)
-    total_dice = int(total_dice_match.group(1)) if total_dice_match else 0
-
-    current_bid_match = re.search(r'Current bid:\s*"([^"]+)"', observation)
-    current_bid = _extract_bid_tuple(current_bid_match.group(1)) if current_bid_match else None
-
-    return {
-        "own_dice": dice,
-        "total_dice": total_dice,
-        "current_bid": current_bid,
-        "wild_six_enabled": "wild" in observation.lower() and "6" in observation,
-    }
-
-
-def _is_liar_label(label: str) -> bool:
-    return "liar" in (label or "").strip().lower()
-
-
-def _bid_rank(bid: tuple[int, int]) -> int:
-    quantity, face = bid
-    return quantity * 6 + face
-
-
-def _count_face_support(own_dice: list[int], target_face: int, wild_six_enabled: bool) -> int:
-    if wild_six_enabled and target_face != 6:
-        return sum(1 for value in own_dice if value == target_face or value == 6)
-    return sum(1 for value in own_dice if value == target_face)
-
-
-def _binomial_tail_probability(num_trials: int, success_prob: float, min_successes: int) -> float:
-    if min_successes <= 0:
-        return 1.0
-    if num_trials <= 0:
-        return 0.0
-
-    success_prob = _clamp(success_prob, 0.0, 1.0)
-    tail_probability = 0.0
-    for successes in range(min_successes, num_trials + 1):
-        tail_probability += math.comb(num_trials, successes) * (success_prob ** successes) * (
-            (1.0 - success_prob) ** (num_trials - successes)
-        )
-    return _clamp(tail_probability, 0.0, 1.0)
-
-
-def _estimate_bid_statistics(state_features: dict, bid: tuple[int, int]) -> dict:
-    own_dice = state_features.get("own_dice") or []
-    total_dice = int(state_features.get("total_dice") or 0)
-    wild_six_enabled = bool(state_features.get("wild_six_enabled"))
-    quantity, face = bid
-
-    if total_dice <= 0 or not own_dice:
-        return {
-            "known_support": 0,
-            "unknown_dice": 0,
-            "expected_total": 0.0,
-            "std_dev": 0.0,
-            "z_score": 0.0,
-            "truth_probability": 0.0,
-        }
-
-    known_support = _count_face_support(own_dice, face, wild_six_enabled)
-    unknown_dice = max(total_dice - len(own_dice), 0)
-    per_die_success_prob = 2.0 / 6.0 if (wild_six_enabled and face != 6) else 1.0 / 6.0
-
-    if unknown_dice == 0:
-        expected_total = float(known_support)
-        std_dev = 0.0
-    else:
-        expected_total = known_support + unknown_dice * per_die_success_prob
-        std_dev = math.sqrt(unknown_dice * per_die_success_prob * (1.0 - per_die_success_prob))
-
-    additional_needed = max(quantity - known_support, 0)
-    truth_probability = _binomial_tail_probability(
-        num_trials=unknown_dice,
-        success_prob=per_die_success_prob,
-        min_successes=additional_needed,
-    )
-
-    if std_dev > 0:
-        z_score = (quantity - expected_total) / std_dev
-    elif quantity <= expected_total:
-        z_score = -1.0
-    else:
-        z_score = 3.0
-
-    return {
-        "known_support": known_support,
-        "unknown_dice": unknown_dice,
-        "expected_total": expected_total,
-        "std_dev": std_dev,
-        "z_score": z_score,
-        "truth_probability": truth_probability,
-    }
-
-
-def _score_bid_plausibility(state_features: dict, bid: tuple[int, int]) -> float:
-    own_dice = state_features.get("own_dice") or []
-    total_dice = int(state_features.get("total_dice") or 0)
-    current_bid = state_features.get("current_bid")
-
-    if total_dice <= 0 or not own_dice:
-        return 0.0
-
-    bid_stats = _estimate_bid_statistics(state_features, bid)
-    truth_probability = float(bid_stats["truth_probability"])
-
-    reward = 0.0
-
-    if truth_probability >= 0.60:
-        reward += BID_PLAUSIBILITY_BONUS
-    elif truth_probability >= 0.35:
-        reward += BID_PLAUSIBILITY_BONUS * 0.5
-    elif truth_probability <= 0.10:
-        reward -= BID_PLAUSIBILITY_PENALTY
-    elif truth_probability <= 0.20:
-        reward -= BID_PLAUSIBILITY_PENALTY * 0.5
-
-    if current_bid is not None:
-        jump = _bid_rank(bid) - _bid_rank(current_bid)
-        if jump <= 2:
-            reward += 0.01
-        elif jump >= 7:
-            if truth_probability < 0.30:
-                reward -= 0.03
-            else:
-                reward += 0.01
-
-    return reward
-
-def _parse_action_id(completion_text: str, legal_action_map: dict[str, str]) -> str:
-    if not legal_action_map:
-        return ""
-
-    cleaned = remove_reasoning_tags(completion_text or "")
-    if cleaned.endswith("</s>"):
-        cleaned = cleaned[:-5]
-    if "Action:" in cleaned:
-        cleaned = cleaned.split("Action:")[-1].strip()
-
-    for num in re.findall(r"-?\d+", cleaned):
-        if num in legal_action_map:
-            return num
-
-    normalized = cleaned.strip().lower()
-    for action_id, label in legal_action_map.items():
-        if normalized == label.strip().lower():
-            return action_id
-
-    if "liar" in normalized:
-        for action_id, label in legal_action_map.items():
-            if _is_liar_label(label):
-                return action_id
-
-    bid_tuple = _extract_bid_tuple(cleaned)
-    if bid_tuple is not None:
-        for action_id, label in legal_action_map.items():
-            if _extract_bid_tuple(label) == bid_tuple:
-                return action_id
-
-    return ""
-
-
-def _score_challenge_decision(
-    state_features: dict,
-    chose_liar: bool,
-    proposed_bid: tuple[int, int] | None,
-) -> tuple[float, dict]:
-    current_bid = state_features.get("current_bid")
-    if current_bid is None:
-        return 0.0, {"current_bid_z": 0.0, "current_bid_truth_probability": 0.0}
-
-    current_bid_stats = _estimate_bid_statistics(state_features, current_bid)
-    current_bid_z = float(current_bid_stats["z_score"])
-    current_bid_truth_probability = float(current_bid_stats["truth_probability"])
-    reward = 0.0
-
-    if chose_liar:
-        # Good Liar timing: challenge when the active bid is unlikely under belief.
-        if current_bid_truth_probability <= 0.15:
-            reward += LIAR_CALL_GOOD_BONUS * (
-                1.0 - _clamp(current_bid_truth_probability / 0.15, 0.0, 1.0)
-            )
-        # Risky Liar: current bid is plausible — calling Liar is often wrong.
-        elif current_bid_truth_probability >= 0.45:
-            reward -= LIAR_CALL_BAD_PENALTY * _clamp(
-                (current_bid_truth_probability - 0.45) / 0.55, 0.0, 1.0
-            )
-    elif proposed_bid is not None:
-        if current_bid_truth_probability <= 0.10:
-            reward -= PASS_MISSED_CHALLENGE_PENALTY * (
-                1.0 + _clamp((0.10 - current_bid_truth_probability) / 0.10, 0.0, 1.0)
-            )
-        elif current_bid_truth_probability >= 0.55:
-            reward += 0.01
-
-    return reward, {
-        "current_bid_z": current_bid_z,
-        "current_bid_truth_probability": current_bid_truth_probability,
-    }
-
-
-def _belief_coaching_prefix(state_features: dict) -> str:
-    """Optional numeric belief line (only used when curriculum hints are on)."""
-    if not _is_truthy_env(os.environ.get("LIARS_DICE_BELIEF_COACHING", "1")):
-        return ""
-    cb = state_features.get("current_bid")
-    if not cb:
-        return ""
-    st = _estimate_bid_statistics(state_features, cb)
-    p = float(st["truth_probability"])
-    z = float(st["z_score"])
-    return (
-        f"[Coaching] P(current bid is true)≈{p:.2f}; z-score vs mean≈{z:.2f}. "
-        "Output one action ID only.\n\n"
-    )
-
-
-def _user_observation_with_coaching(
-    formatted_observation: str, state_features: dict, use_hints: bool
-) -> str:
-    if not use_hints:
-        return formatted_observation
-    prefix = _belief_coaching_prefix(state_features)
-    return prefix + formatted_observation if prefix else formatted_observation
-
-
-def _first_legal_action_id(legal_action_map: dict[str, str]) -> str:
-    """Stable first choice when no belief signal; numeric ids sort before non-numeric."""
-    if not legal_action_map:
-        return ""
-
-    def _sort_key(k: str) -> tuple[int, str]:
-        try:
-            return (0, f"{int(k):020d}")
-        except ValueError:
-            return (1, k)
-
-    return sorted(legal_action_map.keys(), key=_sort_key)[0]
-
-
-def _select_fallback_action(legal_action_map: dict[str, str], state_features: dict) -> str:
-    """Pick a legal action when parsing fails: belief-first Liar, else most plausible bid."""
-    liar_actions = [
-        action_id
-        for action_id, label in legal_action_map.items()
-        if _is_liar_label(label)
-    ]
-    bid_actions: list[tuple[str, str]] = [
-        (action_id, label)
-        for action_id, label in legal_action_map.items()
-        if not _is_liar_label(label)
-    ]
-    current_bid = state_features.get("current_bid")
-    if liar_actions and current_bid is not None:
-        current_bid_truth_probability = float(
-            _estimate_bid_statistics(state_features, current_bid)["truth_probability"]
-        )
-        if current_bid_truth_probability <= 0.12:
-            return liar_actions[0]
-
-    best_id: str | None = None
-    best_score = -1e9
-    for action_id, label in bid_actions:
-        bt = _extract_bid_tuple(label)
-        if bt is None:
-            continue
-        score = _score_bid_plausibility(state_features, bt)
-        if score > best_score:
-            best_score = score
-            best_id = action_id
-    if best_id is not None:
-        return best_id
-
-    if liar_actions:
-        return liar_actions[0]
-    return _first_legal_action_id(legal_action_map)
-
-
-def _extract_terminal_reward(step_block: dict, observation_text: str) -> float:
-    info = step_block.get("info", {}) if isinstance(step_block, dict) else {}
-
-    cumulative_reward = info.get("cumulative_reward")
-    if isinstance(cumulative_reward, (int, float)):
-        return _clamp(float(cumulative_reward), -TERMINAL_REWARD_CLIP, TERMINAL_REWARD_CLIP)
-
-    your_return_match = re.search(r"Your Return:\s*([+-]?\d+(?:\.\d+)?)", observation_text or "")
-    if your_return_match:
-        return _clamp(float(your_return_match.group(1)), -TERMINAL_REWARD_CLIP, TERMINAL_REWARD_CLIP)
-
-    normalized_match = re.search(r"Normalized Score:\s*([+-]?\d+(?:\.\d+)?)", observation_text or "")
-    result_match = re.search(r"Result:\s*(WIN|LOSS|DRAW)", observation_text or "", flags=re.IGNORECASE)
-    if normalized_match:
-        normalized_value = float(normalized_match.group(1))
-        if result_match:
-            result = result_match.group(1).upper()
-            if result == "LOSS":
-                normalized_value = -abs(normalized_value) if normalized_value != 0 else -1.0
-            elif result == "WIN":
-                normalized_value = abs(normalized_value) if normalized_value != 0 else 1.0
-            else:
-                normalized_value = 0.0
-        return _clamp(normalized_value, -TERMINAL_REWARD_CLIP, TERMINAL_REWARD_CLIP)
-
-    step_reward = _safe_float(step_block.get("reward", 0.0), default=0.0)
-    return _clamp(step_reward, -TERMINAL_REWARD_CLIP, TERMINAL_REWARD_CLIP)
-
-
-def _build_env_pool(server_urls: list[str]) -> list[dict[str, str]]:
-    env_pool = []
-    init_task_id = GAME_TO_TASK_ID_RANGE[SELECTED_GAME][0]
-
-    for idx, base_url in enumerate(server_urls):
-        try:
-            print(f"[INIT] Initializing env on server {idx}: {base_url}")
-            payload = {"task_id": init_task_id, "seed": random.randint(0, 2**31 - 1), **MCTS_CONFIG}
-            res = requests.post(f"{base_url}/reset", json=payload, timeout=INIT_TIMEOUT_SECONDS)
-            res.raise_for_status()
-            env_pool.append({"base_url": base_url})
-            print(f"[INIT] Server {idx} ready")
-        except Exception as e:
-            raise RuntimeError(f"Failed to init server {base_url}: {e}") from e
-
-    return env_pool
-
-
-def _initialize_rollout_state(trainer) -> None:
-    if _ROLLOUT_STATE.get("initialized", False):
-        return
-
+def init_env_pool(reset_payload: dict):
+    """Initialise environment server pool (inline, no shared_env dependency)."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Lock
     rank = int(os.environ.get("LOCAL_RANK", "0"))
     raw_urls = os.environ.get("ENVIRONMENT_SERVER_URLS", "")
     server_urls = [u.strip() for u in raw_urls.split(",") if u.strip()]
     if not server_urls:
         raise RuntimeError("ENVIRONMENT_SERVER_URLS is empty")
-
-    env_pool = _build_env_pool(server_urls)
-    rollout_per_stage = int(getattr(trainer.args, "rollouts_per_stage", 1280))
-    initial_max_turn = int(getattr(trainer.args, "initial_max_turn", 2))
-    final_max_turn = int(os.environ.get("LIARS_DICE_FINAL_MAX_TURN", "20"))
-    initial_hint_prob = float(os.environ.get("LIARS_DICE_INITIAL_HINT_PROB", "0.0"))
-    final_hint_prob = float(os.environ.get("LIARS_DICE_FINAL_HINT_PROB", "0.0"))
-
-    _ROLLOUT_STATE["rank"] = rank
-    _ROLLOUT_STATE["env_pool"] = env_pool
-    _ROLLOUT_STATE["num_servers"] = len(env_pool)
-    _ROLLOUT_STATE["thread_pool"] = ThreadPoolExecutor(max_workers=len(env_pool))
-    _ROLLOUT_STATE["generation_semaphore"] = Semaphore(1)
-    _ROLLOUT_STATE["curriculum"] = CurriculumScheduler(
-        initial_max_turn=initial_max_turn,
-        final_max_turn=final_max_turn,
-        rollouts_per_stage=rollout_per_stage,
-        initial_hint_prob=initial_hint_prob,
-        final_hint_prob=final_hint_prob,
-        warmup_rollouts=128,
-    )
-    _ROLLOUT_STATE["initialized"] = True
-
-    if rank == 0:
-        print(f"[LIARS] MCTS /reset config (match tournament eval): {MCTS_CONFIG}")
-
-    trace_enabled = _is_truthy_env(os.environ.get("EPISODE_TRACE_ENABLED", "1"))
-    trace_dir = os.environ.get("EPISODE_TRACE_DIR", "").strip()
-    _ROLLOUT_STATE["trace_logger"] = None
-    if trace_enabled and trace_dir:
+    env_pool: list[dict] = []
+    for idx, base_url in enumerate(server_urls):
         try:
-            _ROLLOUT_STATE["trace_logger"] = EpisodeTraceLogger(trace_dir=trace_dir, rank=rank)
-        except Exception as e:
-            print(f"[EPISODE_TRACE] Failed to initialize logger: {e}")
-    elif rank == 0:
-        print("[EPISODE_TRACE] Disabled (set EPISODE_TRACE_ENABLED=1 and EPISODE_TRACE_DIR)")
+            print(f"[INIT] Connecting to server {idx}: {base_url}")
+            res = requests.post(f"{base_url}/reset", json=reset_payload, timeout=300)
+            res.raise_for_status()
+            env_pool.append({"base_url": base_url})
+            print(f"[INIT] Server {idx} ready")
+        except Exception as exc:
+            raise RuntimeError(f"Failed to init server {base_url}: {exc}") from exc
+    thread_pool = ThreadPoolExecutor(max_workers=len(env_pool))
+    generation_semaphore = Semaphore(1)
+    return rank, env_pool, len(env_pool), thread_pool, generation_semaphore
 
 
-def _reset_environment(env_endpoint: str, game_id: int, timeout: int) -> tuple[str, str]:
-    payload = {"task_id": game_id, "seed": random.randint(0, 2**31 - 1), **MCTS_CONFIG}
-    reset_res = requests.post(f"{env_endpoint}/reset", json=payload, timeout=timeout)
-    reset_res.raise_for_status()
-    reset_data = reset_res.json()
-    result_block = reset_data["result"]
-    episode_id = result_block.get("episode_id", "")
-    raw_observation = result_block.get("observation", "")
-    return episode_id, extract_and_format_observation(raw_observation)
+def rollout_reward_func(completions, **kwargs):
+    """Generic reward passthrough (inline for Release-1 compatibility)."""
+    rewards = kwargs.get("env_rewards") if kwargs else None
+    return [float(r) for r in rewards] if rewards is not None else [0.0] * len(completions)
 
 
-def _step_environment(
-    env_endpoint: str,
-    episode_id: str,
-    action_to_send: str,
-    timeout: int,
-) -> tuple[str, float, bool, dict]:
-    step_payload = {"action": action_to_send, "episode_id": episode_id}
-    step_res = requests.post(f"{env_endpoint}/step", json=step_payload, timeout=timeout)
-    step_res.raise_for_status()
-    step_data = step_res.json()
-    step_block = step_data["result"]
-    raw_observation = step_block.get("observation", "")
-    formatted_observation = extract_and_format_observation(raw_observation)
-    step_reward = _safe_float(step_block.get("reward", 0.0), default=0.0)
-    done = bool(step_block.get("done", False))
-    return formatted_observation, step_reward, done, step_block
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+_SELECTED_GAME      = "leduc_poker"
+_MAX_EPISODE_TOKENS = 16384
+_MAX_PROMPT_LEN     = 16384 - 256
+_TIMEOUT            = 2400
+_MAX_TURNS          = 10           # hard episode cap
+
+# ── Reward constants (R1 + Release-6) ──────────────────────────────────────
+TERMINAL_WIN_REWARD  =  1.0
+TERMINAL_LOSS_REWARD = -1.0
+PAIR_BONUS           =  0.15   # R1: bonus when winning hand contains a pair
+HIGHCARD_WIN_BONUS   =  0.05   # R1: bonus for winning with high card
+CHIP_WEIGHT          =  0.15   # R1 (scaled): chip-improvement fraction of reward
+INVALID_PENALTY      = -0.1    # per invalid step
+INVALID_TOTAL_CLIP   = -0.3    # R1: hard floor on accumulated invalid penalty
+
+# ── Normalize intermediate rewards by episode length (Release-6) ───────────
+NORMALIZE_REWARDS = True
 
 
-def _last_prompt_fallback_result() -> dict:
-    return {
-        "prompt_ids": [1],
-        "completion_ids": [1],
-        "logprobs": [1.0],
-        "reward": 0.0,
-        "final_score": 0.0,
+# ---------------------------------------------------------------------------
+# System prompts
+# ---------------------------------------------------------------------------
+
+_BASE_SYSTEM_PROMPT = (
+    "You are playing leduc_poker.\n\n"
+    "# Game Rules\n"
+    "LEDUC POKER RULES:\n\n"
+    "Deck: 2 suits \u00d7 (num_players + 1) ranks. "
+    "For 2 players: 6 cards (J\u2660 J\u2665 Q\u2660 Q\u2665 K\u2660 K\u2665).\n\n"
+    "Setup: Each player starts with 100 chips, pays 1 ante. Two rounds of betting.\n\n"
+    "Round 1: Each player receives one private card. Actions: Fold (lose ante), "
+    "Call/Check (match current bet), Raise (add 2 chips to bet). Maximum 2 raises per round.\n"
+    "Round 2: One public card is revealed. Same actions, but Raise adds 4 chips.\n\n"
+    "Winning: Player with best hand wins pot (or last remaining if others fold).\n"
+    "Hand ranking (high to low): Pair (private + public match) > High card value (K > Q > J).\n\n"
+    "\n# Output Format\n"
+    "You must respond with ONLY the action ID (a single number).\n"
+    "Do NOT include descriptions or explanations.\n\n"
+    "Examples:\n"
+    '- For action "0 -> fold": respond "0"\n'
+    '- For action "1 -> call": respond "1"\n'
+    '- For action "2 -> raise": respond "2"'
+)
+
+_HINT_PROMPT = (
+    "\n\n# Strategy Tips\n"
+    "Round 1:\n"
+    "- Hold K or Q \u2192 call a raise; raise first if unchallenged.\n"
+    "- Hold J \u2192 fold against a raise; check if unchallenged.\n\n"
+    "Round 2 (public card revealed):\n"
+    "- You have a PAIR \u2192 raise aggressively; never fold.\n"
+    "- You have K (no pair) \u2192 raise first; call if opponent raises.\n"
+    "- You have Q (no pair), public card is K \u2192 raise; call if opponent raises.\n"
+    "- You have Q (no pair), public card is J \u2192 check; fold if opponent raises.\n"
+    "- You have J (no pair) \u2192 check; fold if opponent raises.\n"
+    "- IMPORTANT: YOU MUST PICK THE ACTION ID FROM THE LEGAL ACTIONS."
+)
+
+
+# ---------------------------------------------------------------------------
+# Card utilities  (R1)
+# ---------------------------------------------------------------------------
+
+_CARD_RANK: dict[str, int] = {"J": 1, "Q": 2, "K": 3}
+
+
+def _card_rank(card_name: str) -> int:
+    if not card_name:
+        return 0
+    return _CARD_RANK.get(card_name[0].upper(), 0)
+
+
+def _is_pair(private: str, public: str) -> bool:
+    if not private or not public:
+        return False
+    return private[0].upper() == public[0].upper()
+
+
+# ---------------------------------------------------------------------------
+# GameState  (boss rich properties + R1 chip tracking)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GameState:
+    """
+    Unified Leduc Poker game state.
+
+    Combines:
+    - Boss:    player_id, opp_last_action, raises_this_round, hand_strength,
+               pot_odds_ratio, equity_estimate, can_raise, max_raises_reached
+    - R1:      my_chips, opp_chips, phase, chip-delta computation
+    - Merged:  has_pair() callable + has_pair bool from boss parser
+    """
+    # Core fields (populated by parser)
+    player_id:         int
+    private_card:      str           # e.g. "K\u2660"
+    private_card_rank: int           # J=1, Q=2, K=3
+    public_card:       Optional[str] # None in round 1
+    public_card_rank:  Optional[int]
+    pair:              bool          # True when Hand: Pair in observation
+    round:             int           # 1 or 2
+    pot:               int
+    my_chips:          int           # alias: our_chips
+    opp_chips:         int
+    r1_betting:        list[str]
+    r2_betting:        list[str]
+    legal_actions:     dict[int, str]
+
+    # ── Derived helpers ─────────────────────────────────────────────────────
+
+    def has_pair(self) -> bool:
+        """Callable form for R1 compatibility."""
+        return self.pair
+
+    @property
+    def our_invested(self) -> int:
+        return 100 - self.my_chips
+
+    @property
+    def opp_invested(self) -> int:
+        return 100 - self.opp_chips
+
+    @property
+    def current_round_betting(self) -> list[str]:
+        return self.r1_betting if self.round == 1 else self.r2_betting
+
+    @property
+    def raises_this_round(self) -> int:
+        return self.current_round_betting.count("Raise")
+
+    @property
+    def opp_last_action(self) -> Optional[str]:
+        betting = self.current_round_betting
+        return betting[-1] if betting else None
+
+    @property
+    def opp_raised_this_round(self) -> bool:
+        return "Raise" in self.current_round_betting
+
+    @property
+    def can_raise(self) -> bool:
+        return 2 in self.legal_actions
+
+    @property
+    def can_fold(self) -> bool:
+        return 0 in self.legal_actions
+
+    @property
+    def max_raises_reached(self) -> bool:
+        """True when no more raises are legal this round (cap = 2)."""
+        return not self.can_raise and self.raises_this_round >= 2
+
+    @property
+    def hand_strength(self) -> int:
+        """
+        1–4 scale: Pair=4, K=3, Q=2, J=1
+        """
+        if self.pair:
+            return 4
+        return self.private_card_rank
+
+    @property
+    def is_strong(self) -> bool:
+        return self.hand_strength >= 3
+
+    @property
+    def is_weak(self) -> bool:
+        return self.hand_strength == 1
+
+    @property
+    def pot_odds_ratio(self) -> float:
+        """pot / (pot + call_cost); approximates required equity to call."""
+        call_cost = max(self.opp_invested - self.our_invested, 0)
+        if call_cost == 0:
+            return 1.0
+        return self.pot / (self.pot + call_cost)
+
+    @property
+    def equity_estimate(self) -> float:
+        """Hand-strength-based equity (0.0–1.0)."""
+        return {4: 0.85, 3: 0.65, 2: 0.40, 1: 0.20}.get(self.hand_strength, 0.30)
+
+    @property
+    def call_is_profitable(self) -> bool:
+        return self.equity_estimate >= (1.0 - self.pot_odds_ratio)
+
+    # R1 compat alias
+    @property
+    def total_chips(self) -> int:
+        return self.my_chips
+
+
+# ---------------------------------------------------------------------------
+# Observation parser
+# ---------------------------------------------------------------------------
+
+def _format_observation(raw: str) -> str:
+    """
+    Reformat server observation to eval-framework format.
+    Strips game-rules preamble, normalises indents and prompt wording.
+    (Boss impl — handles both server formats)
+    """
+    player_match = re.search(r"You are Player (\d+)\.", raw)
+    player_line  = f"You are Player {player_match.group(1)}." if player_match else ""
+
+    state_start = raw.find("Current State:")
+    if state_start == -1:
+        return raw
+
+    body = raw[state_start:]
+    legal_start = body.find("Legal Actions:")
+    if legal_start == -1:
+        return body
+
+    state_block   = body[:legal_start].rstrip()
+    actions_block = body[legal_start:]
+    actions_block = re.sub(r"^  (\d+)", r"\1", actions_block, flags=re.MULTILINE)
+    actions_block = actions_block.replace(
+        "Your choice (action ID only):", "Your choice (ID only):"
+    )
+
+    parts = [state_block]
+    if player_line:
+        parts.append(player_line)
+    parts.append(actions_block)
+    return "\n\n".join(parts)
+
+
+def parse_game_state(obs: str) -> Optional[GameState]:
+    """
+    Parse a Leduc Poker observation into a GameState.
+    Returns None if observation cannot be parsed (invalid / empty).
+    """
+    if not obs or "Current State:" not in obs:
+        return None
+
+    def _find(pattern, default=None):
+        m = re.search(pattern, obs)
+        return m.group(1) if m else default
+
+    pid_str = _find(r"You are Player (\d+)\.")
+    if pid_str is None:
+        return None
+    player_id = int(pid_str)
+
+    private_card = _find(r"Your card:\s*(\S+)")
+    if private_card is None:
+        return None
+    private_card_rank = _card_rank(private_card)
+
+    pub_raw          = _find(r"Public card:\s*(\S+)")
+    public_card      = pub_raw
+    public_card_rank = _card_rank(pub_raw) if pub_raw else None
+
+    pair = "Hand: Pair" in obs
+
+    round_str = _find(r"Current round:\s*(\d+)/\d+", "1")
+    round_    = int(round_str)
+
+    pot       = int(_find(r"Pot size:\s*(\d+)", "0"))
+    my_chips  = int(_find(r"Your chips:\s*(\d+)", "100"))
+    opp_chips = int(_find(r"Opponent chips:\s*(\d+)", "100"))
+
+    def _parse_betting(label: str) -> list[str]:
+        m = re.search(rf"{label} betting:\s*(.+)", obs)
+        if not m:
+            return []
+        return [a.strip() for a in m.group(1).split(",")]
+
+    r1_betting = _parse_betting("Round 1")
+    r2_betting = _parse_betting("Round 2")
+
+    legal_actions: dict[int, str] = {}
+    for m in re.finditer(r"^(\d+)\s*->\s*(.+)$", obs, re.MULTILINE):
+        legal_actions[int(m.group(1))] = m.group(2).strip()
+
+    return GameState(
+        player_id=player_id,
+        private_card=private_card,
+        private_card_rank=private_card_rank,
+        public_card=public_card,
+        public_card_rank=public_card_rank,
+        pair=pair,
+        round=round_,
+        pot=pot,
+        my_chips=my_chips,
+        opp_chips=opp_chips,
+        r1_betting=r1_betting,
+        r2_betting=r2_betting,
+        legal_actions=legal_actions,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Action extraction  (R1 — reasoning-tag aware)
+# ---------------------------------------------------------------------------
+
+_REASONING_TAG_PAIRS = [
+    ("think",      "think"),
+    ("thinking",   "thinking"),
+    ("reasoning",  "reasoning"),
+    ("thought",    "thought"),
+    ("reflection", "reflection"),
+]
+
+
+def _remove_reasoning_tags(text: str) -> str:
+    """Strip <think>…</think> and similar reasoning blocks from model output."""
+    cleaned = text
+    for tag, close in _REASONING_TAG_PAIRS:
+        cleaned = re.sub(
+            rf"<{tag}>.*?</{close}>",
+            "",
+            cleaned,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        close_tag = f"</{close}>"
+        if close_tag in cleaned:
+            cleaned = cleaned.split(close_tag)[-1]
+        open_match = re.search(rf"<{tag}>", cleaned, flags=re.IGNORECASE)
+        if open_match:
+            cleaned = cleaned[: open_match.start()]
+    return re.sub(r"\n\s*\n\s*\n", "\n\n", cleaned).strip()
+
+
+def _extract_action_id(completion_text: str) -> str:
+    """
+    Robustly extract a numeric action ID from model output.
+    - Strips reasoning tags (R1)
+    - Handles 'Action: N' format (boss)
+    - Regex fallback to first integer (R1)
+    """
+    cleaned = _remove_reasoning_tags(completion_text)
+    if cleaned.endswith("</s>"):
+        cleaned = cleaned[:-4].strip()
+    if "Action:" in cleaned:
+        cleaned = cleaned.split("Action:")[-1].strip()
+    match = re.search(r"-?\d+", cleaned)
+    return match.group(0) if match else cleaned.strip()
+
+
+# ---------------------------------------------------------------------------
+# Reward Calculator  (all three repos merged)
+# ---------------------------------------------------------------------------
+
+class RewardCalculator:
+    """
+    Unified reward calculator for Leduc Poker.
+
+    Per-step shaping (boss named SIGNALS + new combined signals):
+      • Fold penalties for strong hands (pair, K, Q/K vs raise)
+      • Fold bonuses for weak hands under pressure (J, Q+pubJ)
+      • Raise bonuses (pair R2, K R2, Q+pubK R2, K R1 positional)
+      • Call bonuses (Q/K vs raise, pot-odds profitable, raise-cap)
+      • Invalid penalty per step
+
+    Episode aggregation (Release-6 normalized + R1 terminal enrichment):
+      • terminal_weight = 10.0  — win/loss dominates shaping
+      • PAIR_BONUS / HIGHCARD_WIN_BONUS on wins  (R1)
+      • chip_component = chip delta * CHIP_WEIGHT  (R1, added to terminal)
+      • INVALID_TOTAL_CLIP caps accumulated invalid penalties at -0.3  (R1)
+      • NORMALIZE_REWARDS: G = (Σ γ^(T-1-i)*s_i)/T + terminal_reward  (R6)
+    """
+
+    # ── Named shaping signals (boss + new) ───────────────────────────────
+    SIGNALS: dict[str, float] = {
+        # Bad folds
+        "fold_pair":               -2.0,
+        "fold_k":                  -1.5,
+        "fold_kq_r1_raise":        -1.5,
+        "fold_q_pubk_raise":       -0.5,
+        # Good folds
+        "fold_j_r1_raise":         +0.3,
+        "fold_j_r2_raise":         +0.2,
+        "fold_q_pubj_raise":       +0.2,
+        # Raise bonuses
+        "raise_pair_r2":           +0.4,
+        "raise_k_r2":              +0.2,
+        "raise_q_pubk_r2":         +0.2,   # NEW: Q + pub K = 2nd-best hand
+        "raise_k_r1_p1":           +0.15,  # NEW: positional aggression (P1)
+        # Call / check bonuses
+        "call_kq_r1_raise":        +0.2,
+        "call_pot_odds_profitable": +0.15,  # NEW: pot-odds justified call
+        "call_when_raises_maxed":   +0.1,   # NEW: raise cap hit; call is correct
     }
 
+    def __init__(self, terminal_weight: float = 10.0, gamma: float = 0.9):
+        self.terminal_weight = terminal_weight
+        self.gamma           = gamma
 
-def _full_prompt_fallback_result() -> dict:
-    return {
-        "prompt_ids": [1],
-        "completion_ids": [1],
-        "action_mask": [0],
-        "logprobs": [1.0],
-        "reward": 0.0,
-        "final_score": 0.0,
-    }
+    # ── Per-step shaping ─────────────────────────────────────────────────
+    def calculate_step_reward(
+        self,
+        gs: Optional[GameState],
+        action_str: str,
+        is_invalid: bool = False,
+    ) -> float:
+        """
+        Return per-step shaping score (no terminal component).
+        Invalid actions return INVALID_PENALTY directly.
+        """
+        if is_invalid:
+            return INVALID_PENALTY
 
+        if gs is None:
+            return 0.0
 
-def _execute_parallel_rollouts(prompts, executor, run_single_prompt, fallback_builder):
-    results = [None] * len(prompts)
-    futures = [executor.submit(run_single_prompt, i, p) for i, p in enumerate(prompts)]
+        reward = 0.0
+        pub    = gs.public_card_rank or 0
 
-    for future in as_completed(futures):
-        try:
-            idx, res = future.result()
-            results[idx] = res if res is not None else fallback_builder()
-        except Exception as e:
-            print(f"[ERROR] rollout worker failed: {e}")
+        if action_str == "Fold":
+            if gs.pair:
+                reward += self.SIGNALS["fold_pair"]
+            elif gs.private_card_rank == 3:
+                reward += self.SIGNALS["fold_k"]
+            elif gs.round == 1 and gs.opp_last_action == "Raise":
+                if gs.private_card_rank >= 2:
+                    reward += self.SIGNALS["fold_kq_r1_raise"]
+                else:
+                    reward += self.SIGNALS["fold_j_r1_raise"]
+            elif gs.round == 2 and gs.opp_last_action == "Raise":
+                if gs.private_card_rank == 1:
+                    reward += self.SIGNALS["fold_j_r2_raise"]
+                elif gs.private_card_rank == 2 and pub == 1:
+                    reward += self.SIGNALS["fold_q_pubj_raise"]
+                elif gs.private_card_rank == 2 and pub == 3:
+                    reward += self.SIGNALS["fold_q_pubk_raise"]
 
-    # Keep output aligned to input prompts.
-    for i in range(len(results)):
-        if results[i] is None:
-            results[i] = fallback_builder()
-    return results
+        elif action_str == "Raise":
+            if gs.round == 2 and gs.pair:
+                reward += self.SIGNALS["raise_pair_r2"]
+            elif gs.round == 2 and gs.private_card_rank == 3 and not gs.pair:
+                reward += self.SIGNALS["raise_k_r2"]
+            elif gs.round == 2 and gs.private_card_rank == 2 and pub == 3:
+                reward += self.SIGNALS["raise_q_pubk_r2"]
+            elif gs.round == 1 and gs.player_id == 1 and gs.private_card_rank == 3:
+                reward += self.SIGNALS["raise_k_r1_p1"]
 
+        elif action_str in ("Call", "Check"):
+            if gs.round == 1 and gs.opp_last_action == "Raise" and gs.private_card_rank >= 2:
+                reward += self.SIGNALS["call_kq_r1_raise"]
+            if gs.opp_last_action == "Raise" and gs.call_is_profitable:
+                reward += self.SIGNALS["call_pot_odds_profitable"]
+            if gs.max_raises_reached:
+                reward += self.SIGNALS["call_when_raises_maxed"]
 
-def _log_batch_statistics(list_results: list[dict]) -> None:
-    finished = sum(1 for r in list_results if r["final_score"] != 0)
-    avg_return = sum(r["reward"] for r in list_results) / len(list_results) if list_results else 0.0
-    print(f"[BATCH] Finished: {finished}/{len(list_results)}, AvgReturn: {avg_return:.3f}")
+        return reward
 
+    # ── Episode aggregation ───────────────────────────────────────────────
+    def calculate_terminal_reward(
+        self,
+        env_reward: float,
+        done: bool,
+        initial_state: Optional[GameState],
+        final_state:   Optional[GameState],
+        invalid_penalties: float,
+    ) -> float:
+        """
+        Compute the terminal component of the training return.
 
-def _get_system_prompt(use_hints: bool) -> str:
-    system_prompt = """You are playing liars_dice.
+        Includes (in priority order):
+          1. Win/loss * terminal_weight           (Release-6)
+          2. PAIR_BONUS / HIGHCARD_WIN_BONUS      (R1)
+          3. Chip improvement component            (R1, scaled)
+          4. Accumulated invalid penalties clipped (R1)
+        """
+        terminal = 0.0
 
-# Game Rules
-LIAR'S DICE RULES:
+        if done:
+            if env_reward > 0.5:
+                terminal = TERMINAL_WIN_REWARD * self.terminal_weight
+                if final_state and final_state.pair:
+                    terminal += PAIR_BONUS
+                else:
+                    terminal += HIGHCARD_WIN_BONUS
+            else:
+                terminal = TERMINAL_LOSS_REWARD * self.terminal_weight
+        elif final_state:
+            # Partial progress signal when episode times out
+            terminal = -final_state.hand_strength / 40.0
 
-Setup: Each player has N dice (1-5 depending on variant). All players roll their dice secretly.
+        # Chip improvement (R1) — added to terminal bucket
+        if initial_state and final_state and initial_state.my_chips > 0:
+            chip_delta     = (final_state.my_chips - initial_state.my_chips) / initial_state.my_chips
+            terminal      += chip_delta * CHIP_WEIGHT
 
-Goal: Make bids about total dice across ALL players, or call "Liar" on opponent's bid.
+        # Clip accumulated invalid penalties (R1)
+        clipped_inv = max(invalid_penalties, INVALID_TOTAL_CLIP)
+        terminal   += clipped_inv
 
-Actions:
-- Bid (quantity, face): Claim there are at least 'quantity' dice showing 'face' among all dice.
-- Call Liar: Challenge the previous bid.
+        return terminal
 
-Bidding rules: Each bid must be higher than the previous bid. "Higher" means:
-  - Same face value but higher quantity (e.g., "2 fours" beats "1 four")
-  - Same quantity but higher face value (e.g., "2 fives" beats "2 fours")
+    def calculate_discounted_return(
+        self,
+        step_scores:     list[float],
+        terminal_reward: float = 0.0,
+    ) -> float:
+        """
+        Compute training return.
 
-Wild dice: 6s are WILD and count as ANY face value.
-- When counting dice for a bid, include 6s in the count
-- Example: Bid "3 fours" means at least 3 dice showing EITHER 4 OR 6
+        NORMALIZE_REWARDS = True  (Release-6):
+            G = (Σ γ^(T-1-i) * s_i) / T  +  terminal_reward
+            Length-invariant: short and long episodes contribute equally.
 
-Winning: If you call Liar and previous bid was false, opponent loses. If bid was true or exact, you lose.
-
-# Output Format
-You must respond with ONLY the action ID (a single number). 
-Do NOT include descriptions or explanations. 
-Examples:
-- For action "59 -> 10-6": respond "59"
-- For action "60 -> Liar": respond "60"
-"""
-    if use_hints:
-        system_prompt += "\n" + STRATEGY_TIPS
-    return system_prompt
-
-
-def _rollout_parallelized_curriculum(
-    prompts: list[str],
-    trainer,
-    include_action_mask: bool,
-) -> dict[str, list]:
-    _initialize_rollout_state(trainer)
-
-    rank = _ROLLOUT_STATE["rank"]
-    env_pool = _ROLLOUT_STATE["env_pool"]
-    num_servers = _ROLLOUT_STATE["num_servers"]
-    curriculum: CurriculumScheduler = _ROLLOUT_STATE["curriculum"]
-    trace_logger = _ROLLOUT_STATE["trace_logger"]
-
-    tokenizer = trainer.processing_class
-    timeout = REQUEST_TIMEOUT_SECONDS
-    current_max_turn = curriculum.get_max_turn()
-    current_hint_prob = curriculum.get_hint_prob()
-    print(
-        f"[CURRICULUM] Rollout {curriculum.total_rollouts}: "
-        f"max_turn={current_max_turn}, hint_prob={current_hint_prob:.2f}"
-    )
-
-    def run_single_prompt(index: int, prompt: str):
-        game_id = int(prompt)
-        server_idx = (index + rank) % num_servers
-        server = env_pool[server_idx]
-        env_endpoint = server["base_url"]
-
-        invalid_count = 0
-        done = False
-        final_reward = 0.0
-        turn_number = 0
-        accumulated_shaping_reward = 0.0
-        step_records = []
-        termination_reason = "unknown"
-        last_step_block: dict = {}
-
-        if include_action_mask:
-            episode_prompt_ids: list[int] = []
-            episode_completion_ids: list[int] = []
-            episode_logprobs: list[float] = []
-            episode_action_mask: list[int] = []
-            prev_full_ids: list[int] | None = None
-        else:
-            prompt_ids_last: list[int] = []
-            completion_ids_last: list[int] = []
-            logprobs_last: list[float] = []
-
-        try:
-            episode_id, formatted_observation = _reset_environment(
-                env_endpoint=env_endpoint,
-                game_id=game_id,
-                timeout=timeout,
+        NORMALIZE_REWARDS = False  (legacy boss):
+            G = Σ γ^(T-1-i) * r_i
+        """
+        if not NORMALIZE_REWARDS:
+            if not step_scores:
+                return terminal_reward
+            T = len(step_scores)
+            return (
+                sum(self.gamma ** (T - 1 - i) * r for i, r in enumerate(step_scores))
+                + terminal_reward
             )
-        except Exception as e:
-            print(f"Failed to reset environment (Game {game_id}): {e}")
-            if trace_logger and trace_logger.should_log():
-                trace_logger.log_episode(
-                    {
-                        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                        "game_id": game_id,
-                        "status": "reset_failed",
-                        "error": str(e),
-                    }
+
+        if not step_scores:
+            return terminal_reward
+        T = len(step_scores)
+        discounted_sum = sum(
+            self.gamma ** (T - 1 - i) * s for i, s in enumerate(step_scores)
+        )
+        return discounted_sum / T + terminal_reward
+
+
+# ---------------------------------------------------------------------------
+# Module-level state  (boss pattern — single shared dict per process)
+# ---------------------------------------------------------------------------
+
+_state: dict = {}
+
+
+def _curriculum_factory(args) -> CurriculumScheduler:
+    """Build CurriculumScheduler from trainer args (Release-6 style)."""
+    return CurriculumScheduler(
+        initial_max_turn=args.initial_max_turn,
+        final_max_turn=_MAX_TURNS,
+        rollouts_per_stage=args.rollouts_per_stage,
+        initial_hint_prob=0.75,
+        final_hint_prob=0.0,
+        warmup_rollouts=getattr(args, "rollout_warmup_rollouts", args.rollouts_per_stage),
+    )
+
+
+def _ensure_initialized(trainer) -> None:
+    """One-time env-pool and curriculum setup (no-op on subsequent calls)."""
+    if _state.get("initialized"):
+        return
+
+    reset_payload = {
+        "task_id": GAMES_TO_TASK_ID_RANGE[_SELECTED_GAME][0],
+        "seed":    42,
+        "opponent": "mcts",
+        "mcts_max_simulations": 25,
+        "mcts_num_rollouts": 1,
+    }
+    rank, env_pool, num_servers, thread_pool, generation_semaphore = init_env_pool(reset_payload)
+    curriculum = _curriculum_factory(trainer.args)
+
+    print(
+        f"[CURRICULUM] Initialized (leduc_poker): "
+        f"initial_max_turn={trainer.args.initial_max_turn}, "
+        f"final_max_turn={_MAX_TURNS}, "
+        f"rollouts_per_stage={trainer.args.rollouts_per_stage}"
+    )
+
+    _state.update(
+        initialized=True,
+        rank=rank,
+        env_pool=env_pool,
+        num_servers=num_servers,
+        thread_pool=thread_pool,
+        generation_semaphore=generation_semaphore,
+        curriculum=curriculum,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Core episode runner
+# ---------------------------------------------------------------------------
+
+def _run_episode(
+    index: int,
+    prompt: str,
+    *,
+    use_full_prompt:      bool,
+    env_pool:             list[dict],
+    num_servers:          int,
+    rank:                 int,
+    trainer,
+    tokenizer,
+    generation_semaphore: Semaphore,
+    current_hint_prob:    float,
+    current_mcts_sims:    int,
+) -> tuple[int, Optional[dict]]:
+    """
+    Run one Leduc Poker episode.
+
+    Reward flow (merged):
+      step_scores       — per-turn shaping (no terminal); normalized by T
+      terminal_reward   — win/loss * 10 + PAIR_BONUS + chip_delta (R1+R6)
+      invalid_penalties — accumulated separately, clipped at INVALID_TOTAL_CLIP
+    """
+    game_id      = int(prompt)
+    server_idx   = (index + rank) % num_servers
+    env_endpoint = env_pool[server_idx]["base_url"]
+
+    # Full-prompt accumulation
+    episode_prompt_ids:     list[int]   = []
+    episode_completion_ids: list[int]   = []
+    episode_logprobs:       list[float] = []
+    episode_action_mask:    list[int]   = []
+    prev_full_ids: Optional[list[int]]  = None
+
+    # Last-turn state (overwritten each turn)
+    prompt_ids:     list[int]   = []
+    completion_ids: list[int]   = []
+    logprobs:       list[float] = []
+
+    done              = False
+    final_reward      = 0.0
+    turn_number       = 0
+    invalid_count     = 0
+    invalid_penalties = 0.0       # accumulates INVALID_PENALTY per bad action
+    use_hints         = random.random() < current_hint_prob
+
+    calculator         = RewardCalculator()
+    step_scores:       list[float] = []
+    game_state_history: list[GameState] = []
+
+    # ── Reset ──────────────────────────────────────────────────────────────
+    reset_payload = {
+        "task_id":              game_id,
+        "seed":                 random.randint(0, 2**31 - 1),   # R1: diverse seeds
+        "opponent":             "mcts",
+        "mcts_max_simulations": current_mcts_sims,              # R1: curriculum sims
+        "mcts_num_rollouts":    1,
+    }
+    try:
+        reset_res = requests.post(f"{env_endpoint}/reset", json=reset_payload, timeout=_TIMEOUT)
+        reset_res.raise_for_status()
+        result_block = reset_res.json()["result"]
+        episode_id   = result_block.get("episode_id", "")
+        observation  = _format_observation(result_block.get("observation", ""))
+        gs = parse_game_state(observation)
+        if gs is not None:
+            game_state_history.append(gs)
+    except Exception as exc:
+        import traceback; traceback.print_exc()
+        print(f"Failed to reset (Game {game_id}): {exc}")
+        return index, None
+
+    system_prompt = _BASE_SYSTEM_PROMPT + (_HINT_PROMPT if use_hints else "")
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": observation},
+    ]
+
+    # ── Interaction loop ───────────────────────────────────────────────────
+    while not done and turn_number < _MAX_TURNS:
+        with generation_semaphore:
+            rollout_outputs = generate_rollout_completions(
+                trainer, prompts=[messages], as_chat=True
+            )[0]
+
+        prompt_ids     = rollout_outputs.get("prompt_ids", [])
+        completion_ids = rollout_outputs.get("completion_ids", [])
+        logprobs       = rollout_outputs.get("logprobs", [])
+        completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
+
+        # ── Full-prompt token accumulation ─────────────────────────────────
+        if use_full_prompt:
+            if len(prompt_ids) > _MAX_PROMPT_LEN:
+                print(
+                    f"Warning: Prompt exceeded {_MAX_PROMPT_LEN} tokens "
+                    f"({len(prompt_ids)}) at turn {turn_number}, ending early"
                 )
-            return index, None
-
-        use_hints = random.random() < current_hint_prob
-        initial_features = _extract_state_features(formatted_observation)
-        messages = [
-            {"role": "system", "content": _get_system_prompt(use_hints=use_hints)},
-            {
-                "role": "user",
-                "content": _user_observation_with_coaching(
-                    formatted_observation, initial_features, use_hints
-                ),
-            },
-        ]
-
-        while not done and turn_number < current_max_turn:
-            observation_before_action = formatted_observation
-            legal_action_map = _extract_legal_action_map(observation_before_action)
-            state_features = _extract_state_features(observation_before_action)
-
-            if not legal_action_map:
-                accumulated_shaping_reward -= INVALID_ACTION_PENALTY
-                termination_reason = "no_legal_actions"
+                done = True
                 break
 
-            with _ROLLOUT_STATE["generation_semaphore"]:
-                rollout_outputs = generate_rollout_completions(trainer, prompts=[messages], as_chat=True)[0]
-
-            prompt_ids = rollout_outputs.get("prompt_ids", [])
-            completion_ids = rollout_outputs.get("completion_ids", [])
-            logprobs = rollout_outputs.get("logprobs", [])
-            completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
-
-            if include_action_mask:
-                if len(prompt_ids) > MAX_PROMPT_LEN:
+            if turn_number == 0:
+                episode_prompt_ids = prompt_ids
+                prev_full_ids      = prompt_ids.copy()
+            else:
+                if prev_full_ids is None:
+                    prev_full_ids = prompt_ids.copy()
+                elif prompt_ids[: len(prev_full_ids)] != prev_full_ids:
                     print(
-                        f"Warning: Prompt exceeded {MAX_PROMPT_LEN} tokens ({len(prompt_ids)}) at turn {turn_number}"
+                        f"Warning: token shift at turn {turn_number} "
+                        f"(expected prefix {len(prev_full_ids)}, got {len(prompt_ids)}). "
+                        "Skipping delta mask."
                     )
-                    termination_reason = "max_prompt_len_exceeded"
-                    break
-
-                if turn_number == 0:
-                    episode_prompt_ids = prompt_ids
                     prev_full_ids = prompt_ids.copy()
                 else:
-                    if prev_full_ids is None:
-                        prev_full_ids = prompt_ids.copy()
-                    elif prompt_ids[: len(prev_full_ids)] != prev_full_ids:
-                        prev_full_ids = prompt_ids.copy()
-                    else:
-                        delta_prompt_ids = prompt_ids[len(prev_full_ids) :]
-                        if delta_prompt_ids:
-                            episode_completion_ids.extend(delta_prompt_ids)
-                            episode_logprobs.extend([0.0] * len(delta_prompt_ids))
-                            episode_action_mask.extend([0] * len(delta_prompt_ids))
-                        prev_full_ids = prompt_ids.copy()
+                    delta = prompt_ids[len(prev_full_ids):]
+                    if delta:
+                        episode_completion_ids.extend(delta)
+                        episode_logprobs.extend([0.0] * len(delta))
+                        episode_action_mask.extend([0] * len(delta))
+                    prev_full_ids = prompt_ids.copy()
 
-                if completion_ids:
-                    episode_completion_ids.extend(completion_ids)
-                    episode_logprobs.extend(logprobs)
-                    episode_action_mask.extend([1] * len(completion_ids))
-                    if prev_full_ids is not None:
-                        prev_full_ids = prev_full_ids + completion_ids
-            else:
-                prompt_ids_last = prompt_ids
-                completion_ids_last = completion_ids
-                logprobs_last = logprobs
+            if completion_ids:
+                episode_completion_ids.extend(completion_ids)
+                episode_logprobs.extend(logprobs)
+                episode_action_mask.extend([1] * len(completion_ids))
+                if prev_full_ids is not None:
+                    prev_full_ids = prev_full_ids + completion_ids
 
-            messages.append({"role": "assistant", "content": completion_text})
+        messages.append({"role": "assistant", "content": completion_text})
 
-            action_to_send = _parse_action_id(completion_text, legal_action_map)
-            parse_failed = not action_to_send
-            if parse_failed or action_to_send not in legal_action_map:
-                if parse_failed:
-                    snippet = completion_text.replace("\n", " ")[:160]
-                    print(f"[WARN] parse failed, fallback action used: {snippet}")
-                invalid_count += 1
-                accumulated_shaping_reward -= INVALID_ACTION_PENALTY
-                action_to_send = _select_fallback_action(legal_action_map, state_features)
+        # ── Parse action & step ─────────────────────────────────────────────
+        action_to_send = _extract_action_id(completion_text)  # R1 robust extractor
+        prev_gs = game_state_history[-1] if game_state_history else None
 
-            action_label = legal_action_map.get(action_to_send, "")
-            liar_action = _is_liar_label(action_label)
-            parsed_bid = _extract_bid_tuple(action_label)
-
-            bid_shaping = 0.0
-            decision_shaping = 0.0
-            current_bid_z = 0.0
-            current_bid_truth_probability = 0.0
-            if parsed_bid is not None:
-                bid_shaping = _score_bid_plausibility(state_features, parsed_bid)
-                accumulated_shaping_reward += bid_shaping
-            decision_shaping, decision_meta = _score_challenge_decision(
-                state_features=state_features,
-                chose_liar=liar_action,
-                proposed_bid=parsed_bid,
+        try:
+            step_res = requests.post(
+                f"{env_endpoint}/step",
+                json={"action": action_to_send, "episode_id": episode_id},
+                timeout=_TIMEOUT,
             )
-            current_bid_z = float(decision_meta.get("current_bid_z", 0.0))
-            current_bid_truth_probability = float(decision_meta.get("current_bid_truth_probability", 0.0))
-            accumulated_shaping_reward += decision_shaping
+            step_res.raise_for_status()
+            step_block  = step_res.json()["result"]
+            observation = _format_observation(step_block.get("observation", ""))
+            step_reward = step_block.get("reward", 0)
+            done        = step_block.get("done", False)
+            if not done:
+                gs = parse_game_state(observation)
+                if gs is not None:
+                    game_state_history.append(gs)
+        except Exception as exc:
+            print(f"Step failed (Game {game_id}, turn {turn_number}): {exc}")
+            observation  = ""
+            step_reward  = 0
+            done         = False
+            invalid_count += 1
 
-            try:
-                formatted_observation, step_reward, done, last_step_block = _step_environment(
-                    env_endpoint=env_endpoint,
-                    episode_id=episode_id,
-                    action_to_send=action_to_send,
-                    timeout=timeout,
-                )
-            except Exception as e:
-                print(f"Step failed: {e}")
-                formatted_observation = ""
-                step_reward = -0.01
-                done = False
-                invalid_count += 1
-                accumulated_shaping_reward -= INVALID_ACTION_PENALTY
-                last_step_block = {"reward": step_reward, "done": False}
+        is_invalid = "Nothing happens" in observation or "Invalid" in observation
+        if is_invalid:
+            invalid_count += 1
 
-            observation_lower = formatted_observation.lower()
-            invalid_or_noop = (
-                "invalid" in observation_lower
-                or "nothing happens" in observation_lower
-                or "nothing happened" in observation_lower
+        if done:
+            final_reward = step_reward
+
+        # ── Per-step shaping ────────────────────────────────────────────────
+        try:
+            action_str = (
+                prev_gs.legal_actions.get(int(action_to_send.strip()), "")
+                if prev_gs else ""
             )
-            if invalid_or_noop:
-                invalid_count += 1
-                accumulated_shaping_reward -= INVALID_ACTION_PENALTY
+        except (ValueError, AttributeError):
+            action_str = ""
 
-            if done:
-                final_reward = _extract_terminal_reward(last_step_block, formatted_observation)
-                termination_reason = "done"
-            else:
-                next_features = _extract_state_features(formatted_observation)
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": _user_observation_with_coaching(
-                            formatted_observation, next_features, use_hints
-                        ),
-                    }
-                )
+        step_score = calculator.calculate_step_reward(prev_gs, action_str, is_invalid=is_invalid)
+        step_scores.append(step_score)
+        if is_invalid:
+            invalid_penalties += INVALID_PENALTY
 
-            step_records.append(
-                {
-                    "turn": turn_number,
-                    "assistant_text": trace_logger.clip_text(completion_text) if trace_logger else completion_text,
-                    "parsed_action": action_to_send,
-                    "action_label": action_label,
-                    "observation_before_action": (
-                        trace_logger.clip_text(observation_before_action)
-                        if trace_logger
-                        else observation_before_action
-                    ),
-                    "observation_after_action": (
-                        trace_logger.clip_text(formatted_observation) if trace_logger else formatted_observation
-                    ),
-                    "step_reward": float(step_reward),
-                    "bid_shaping": float(bid_shaping),
-                    "decision_shaping": float(decision_shaping),
-                    "current_bid_z": float(current_bid_z),
-                    "current_bid_truth_probability": float(current_bid_truth_probability),
-                    "done": bool(done),
-                    "invalid_or_noop": invalid_or_noop,
-                    "parse_failed": bool(parse_failed),
-                }
-            )
+        messages.append({"role": "user", "content": observation})
+        turn_number += 1
 
-            turn_number += 1
+    # ── Episode reward ──────────────────────────────────────────────────────
+    initial_st = game_state_history[0]  if game_state_history else None
+    final_st   = game_state_history[-1] if game_state_history else None
 
-        if not done:
-            if termination_reason == "unknown":
-                termination_reason = "max_turn_reached"
-            final_reward = 0.0
-
-        clipped_shaping = _clamp(accumulated_shaping_reward, -SHAPING_REWARD_CLIP, SHAPING_REWARD_CLIP)
-        train_reward = final_reward + clipped_shaping
-
-        print(
-            f"[ID:{game_id} Done:{int(done)} T:{turn_number:2d} "
-            f"Env:{final_reward:+.3f} Shape:{accumulated_shaping_reward:+.3f} "
-            f"ClipShape:{clipped_shaping:+.3f} Inv:{invalid_count}"
-        )
-
-        if trace_logger and trace_logger.should_log():
-            trace_logger.log_episode(
-                {
-                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                    "game_id": game_id,
-                    "episode_id": episode_id,
-                    "environment": "liars_dice",
-                    "status": "completed" if done else "truncated",
-                    "termination_reason": termination_reason,
-                    "turns": turn_number,
-                    "final_reward": float(final_reward),
-                    "raw_shaping_reward": float(accumulated_shaping_reward),
-                    "clipped_shaping_reward": float(clipped_shaping),
-                    "train_reward": float(train_reward),
-                    "invalid_count": invalid_count,
-                    "steps": step_records,
-                }
-            )
-
-        if include_action_mask:
-            if len(episode_completion_ids) > MAX_EPISODE_TOKENS:
-                episode_completion_ids = episode_completion_ids[:MAX_EPISODE_TOKENS]
-                episode_logprobs = episode_logprobs[:MAX_EPISODE_TOKENS]
-                episode_action_mask = episode_action_mask[:MAX_EPISODE_TOKENS]
-
-            return index, {
-                "prompt_ids": episode_prompt_ids,
-                "completion_ids": episode_completion_ids,
-                "action_mask": episode_action_mask,
-                "logprobs": episode_logprobs,
-                "reward": train_reward,
-                "final_score": final_reward,
-            }
-
-        return index, {
-            "prompt_ids": prompt_ids_last,
-            "completion_ids": completion_ids_last,
-            "logprobs": logprobs_last,
-            "reward": train_reward,
-            "final_score": final_reward,
-        }
-
-    executor = _ROLLOUT_STATE["thread_pool"]
-    fallback_builder = _full_prompt_fallback_result if include_action_mask else _last_prompt_fallback_result
-    list_results = _execute_parallel_rollouts(
-        prompts=prompts,
-        executor=executor,
-        run_single_prompt=run_single_prompt,
-        fallback_builder=fallback_builder,
+    terminal_reward = calculator.calculate_terminal_reward(
+        env_reward=final_reward,
+        done=done,
+        initial_state=initial_st,
+        final_state=final_st,
+        invalid_penalties=invalid_penalties,
+    )
+    train_reward = calculator.calculate_discounted_return(
+        step_scores=step_scores,
+        terminal_reward=terminal_reward,
     )
 
-    curriculum.step(len(prompts))
-    _log_batch_statistics(list_results)
+    print(
+        "[ID:{:<6} Done:{} T:{:>2d} | Hints:{} | MCTS:{:>2d} | "
+        "EnvR:{:>6.2f} | TrainR:{:>7.3f} | Inv:{} | Norm:{}]".format(
+            str(game_id)[:6], int(done), turn_number, int(use_hints),
+            current_mcts_sims, final_reward, train_reward,
+            invalid_count, int(NORMALIZE_REWARDS),
+        )
+    )
 
-    if include_action_mask:
-        return {
-            "prompt_ids": [r["prompt_ids"] for r in list_results],
-            "completion_ids": [r["completion_ids"] for r in list_results],
-            "action_mask": [r["action_mask"] for r in list_results],
-            "logprobs": [r["logprobs"] for r in list_results],
-            "env_rewards": [r["reward"] for r in list_results],
+    # ── Build result ────────────────────────────────────────────────────────
+    if use_full_prompt:
+        if len(episode_completion_ids) > _MAX_EPISODE_TOKENS:
+            episode_completion_ids = episode_completion_ids[:_MAX_EPISODE_TOKENS]
+            episode_logprobs       = episode_logprobs[:_MAX_EPISODE_TOKENS]
+            episode_action_mask    = episode_action_mask[:_MAX_EPISODE_TOKENS]
+        return index, {
+            "prompt_ids":     episode_prompt_ids,
+            "completion_ids": episode_completion_ids,
+            "action_mask":    episode_action_mask,
+            "logprobs":       episode_logprobs,
+            "reward":         train_reward,
+            "final_score":    final_reward,
+        }
+    else:
+        return index, {
+            "prompt_ids":     prompt_ids,
+            "completion_ids": completion_ids,
+            "logprobs":       logprobs,
+            "reward":         train_reward,
+            "final_score":    final_reward,
         }
 
-    return {
-        "prompt_ids": [r["prompt_ids"] for r in list_results],
+
+# ---------------------------------------------------------------------------
+# Shared dispatch  (boss + Release-6 pattern)
+# ---------------------------------------------------------------------------
+
+def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
+    """Common parallelisation + aggregation for both rollout variants."""
+    _ensure_initialized(trainer)
+
+    curriculum         = _state["curriculum"]
+    current_optimizer_step = getattr(getattr(trainer, "state", None), "global_step", 0)
+    current_hint_prob  = curriculum.get_hint_prob()               # rollout-count decay
+    current_mcts_sims  = getattr(curriculum, "get_mcts_sims",     # R1: optional mcts
+                                  lambda *_: 25)(current_optimizer_step)
+
+    print(
+        f"[CURRICULUM] Rollout {curriculum.total_rollouts}, "
+        f"step {current_optimizer_step}: "
+        f"hint_prob={current_hint_prob:.2f}, mcts_sims={current_mcts_sims}"
+    )
+
+    run = functools.partial(
+        _run_episode,
+        use_full_prompt=use_full_prompt,
+        env_pool=_state["env_pool"],
+        num_servers=_state["num_servers"],
+        rank=_state["rank"],
+        trainer=trainer,
+        tokenizer=trainer.processing_class,
+        generation_semaphore=_state["generation_semaphore"],
+        current_hint_prob=current_hint_prob,
+        current_mcts_sims=current_mcts_sims,
+    )
+
+    _fallback = (
+        {"prompt_ids": [1], "completion_ids": [1], "action_mask": [0],
+         "logprobs": [1.0], "reward": 0.0, "final_score": 0.0}
+        if use_full_prompt else
+        {"prompt_ids": [1], "completion_ids": [1],
+         "logprobs": [1.0], "reward": 0.0, "final_score": 0.0}
+    )
+
+    results = [None] * len(prompts)
+    futures = [_state["thread_pool"].submit(run, i, p) for i, p in enumerate(prompts)]
+    for f in as_completed(futures):
+        idx, res = f.result()
+        results[idx] = res if res is not None else _fallback
+
+    curriculum.step(len(prompts))
+
+    list_results = [r for r in results if r is not None]
+    finished   = sum(1 for r in list_results if r["final_score"] != 0)
+    wins       = sum(1 for r in list_results if r["final_score"] > 0.5)   # R1
+    avg_return = sum(r["reward"] for r in list_results) / len(list_results) if list_results else 0
+    print(
+        f"[BATCH] Finished:{finished}/{len(list_results)} "
+        f"Wins:{wins} AvgReturn:{avg_return:.3f}"                          # R1 wins
+    )
+
+    out = {
+        "prompt_ids":     [r["prompt_ids"]     for r in list_results],
         "completion_ids": [r["completion_ids"] for r in list_results],
-        "logprobs": [r["logprobs"] for r in list_results],
-        "env_rewards": [r["reward"] for r in list_results],
+        "logprobs":       [r["logprobs"]       for r in list_results],
+        "env_rewards":    [r["reward"]         for r in list_results],
     }
+    if use_full_prompt:
+        out["action_mask"] = [r["action_mask"] for r in list_results]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Public rollout functions
+# ---------------------------------------------------------------------------
+
+def rollout_full_prompt_and_completion_parallelized_curriculum(
+    prompts: list[str],
+    trainer,
+    max_turns: int = _MAX_TURNS,
+) -> dict[str, list]:
+    """Parallelised rollout — accumulates all turns with action masking."""
+    return _dispatch(prompts, trainer, use_full_prompt=True)
 
 
 def rollout_last_prompt_and_completion_parallelized_curriculum(
     prompts: list[str],
     trainer,
-    max_turns: int = 30,
+    max_turns: int = _MAX_TURNS,
 ) -> dict[str, list]:
-    del max_turns  # Curriculum controls effective horizon.
-    return _rollout_parallelized_curriculum(prompts=prompts, trainer=trainer, include_action_mask=False)
-
-
-def rollout_full_prompt_and_completion_parallelized_curriculum(
-    prompts: list[str],
-    trainer,
-    max_turns: int = 30,
-) -> dict[str, list]:
-    del max_turns  # Curriculum controls effective horizon.
-    return _rollout_parallelized_curriculum(prompts=prompts, trainer=trainer, include_action_mask=True)
-
-
-def rollout_reward_func(completions, **kwargs):
-    rewards = kwargs.get("env_rewards") if kwargs else None
-    return [float(r) for r in rewards] if rewards is not None else [0.0] * len(completions)
+    """Parallelised rollout — returns only the last turn's token IDs."""
+    return _dispatch(prompts, trainer, use_full_prompt=False)
